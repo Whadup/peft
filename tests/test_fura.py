@@ -14,8 +14,8 @@
 
 import copy
 import tempfile
-import unittest
 
+import pytest
 import torch
 from torch import nn
 
@@ -38,8 +38,9 @@ class MLP(nn.Module):
         return self.lin1(self.relu(self.lin0(x)))
 
 
-class TestFuRA(unittest.TestCase):
-    def setUp(self):
+class TestFuRA:
+    @pytest.fixture(autouse=True)
+    def setup(self):
         torch.manual_seed(42)
         self.in_features = 32
         self.hidden_features = 64
@@ -341,5 +342,151 @@ class TestFuRA(unittest.TestCase):
         assert y_eval.shape == (self.batch_size, self.out_features)
 
 
-if __name__ == "__main__":
-    unittest.main()
+class TestFuRAConfigValidation:
+    @pytest.mark.parametrize(
+        "kwargs, match",
+        [
+            ({"init_mode": "deafult"}, "init_mode must be one of"),
+            ({"input_factorization": "typo"}, "input_factorization as string must be"),
+            ({"input_factorization": (1, 2, 3)}, "input_factorization must be None"),
+            ({"input_factorization": {"lin0": 8}}, "input_factorization dict values must be"),
+            ({"output_factorization": (1, 2, 3)}, "output_factorization must be None"),
+            ({"save_frozen_core": False, "is_quantized": True}, "not supported together with is_quantized"),
+            ({"save_frozen_core": False, "init_weights": False}, "requires init_weights=True"),
+        ],
+    )
+    def test_invalid_config_raises(self, kwargs, match):
+        with pytest.raises(ValueError, match=match):
+            FuRAConfig(target_modules=["lin0"], **kwargs)
+
+
+class TestFuRAInputFactorization:
+    @pytest.mark.parametrize(
+        "input_factorization, expected",
+        [
+            (None, (4, 8)),
+            ("closest", (4, 8)),
+            ((2, 16), (2, 16)),
+            ({"lin0": (8, 4)}, (8, 4)),
+            ({"unrelated": (8, 4)}, (4, 8)),
+        ],
+    )
+    def test_input_factorization_forms(self, input_factorization, expected):
+        model = MLP(in_features=32, hidden_features=64, out_features=16)
+        config = FuRAConfig(target_modules=["lin0"], input_factorization=input_factorization)
+        peft_model = get_peft_model(model, config)
+        layer = peft_model.base_model.model.lin0
+        assert (layer.n["default"], layer.b["default"]) == expected
+
+    def test_input_factorization_mismatch_raises(self):
+        model = MLP(in_features=32, hidden_features=64, out_features=16)
+        config = FuRAConfig(target_modules=["lin0"], input_factorization=(3, 5))
+        with pytest.raises(ValueError, match="does not match in_features"):
+            get_peft_model(model, config)
+
+    def test_input_factorization_head_without_model_config_raises(self):
+        model = MLP(in_features=32, hidden_features=64, out_features=16)
+        config = FuRAConfig(target_modules=["lin0"], input_factorization="head")
+        with pytest.raises(ValueError, match="num_attention_heads"):
+            get_peft_model(model, config)
+
+
+class TestFuRAFrozenWeights:
+    def test_frozen_names_are_per_layer(self):
+        # `frozen_peft_weight_names` is a mutable class attribute, so each layer must own its own dict.
+        model = MLP(in_features=32, hidden_features=64, out_features=4, bias=False)
+        config = FuRAConfig(target_modules=["lin0", "lin1"], train_position="small")
+        peft_model = get_peft_model(model, config)
+        lin0 = peft_model.base_model.model.lin0
+        lin1 = peft_model.base_model.model.lin1
+
+        assert FuRALayer.frozen_peft_weight_names == {}
+        assert lin0.frozen_peft_weight_names is not lin1.frozen_peft_weight_names
+        for layer in (lin0, lin1):
+            small = "fura_r" if layer.fura_r["default"].numel() <= layer.fura_l["default"].numel() else "fura_l"
+            large = "fura_l" if small == "fura_r" else "fura_r"
+            assert getattr(layer, small)["default"].requires_grad
+            assert not getattr(layer, large)["default"].requires_grad
+            assert layer.frozen_peft_weight_names["default"] == (large,)
+
+
+class TestFuRASingleActiveAdapter:
+    def _two_adapter_model(self):
+        model = MLP(in_features=32, hidden_features=64, out_features=16)
+        peft_model = get_peft_model(model, FuRAConfig(target_modules=["lin0"]))
+        peft_model.add_adapter("other", FuRAConfig(target_modules=["lin0"]))
+        peft_model.base_model.set_adapter(["default", "other"])
+        return peft_model
+
+    def test_forward_with_two_active_adapters_raises(self):
+        peft_model = self._two_adapter_model()
+        with pytest.raises(ValueError, match="only one adapter can be active"):
+            peft_model(torch.randn(4, 32))
+
+    def test_merging_two_adapters_raises(self):
+        peft_model = self._two_adapter_model()
+        with pytest.raises(ValueError, match="single merged adapter"):
+            peft_model.base_model.merge_adapter()
+
+
+class TestFuRABiasMerge:
+    def test_fura_only_bias_merges_into_bias_free_base_layer(self):
+        torch.manual_seed(0)
+        model = MLP(in_features=32, hidden_features=64, out_features=16, bias=False)
+        config = FuRAConfig(target_modules=["lin0"], bias="fura_only")
+        peft_model = get_peft_model(model, config)
+        with torch.no_grad():
+            peft_model.base_model.model.lin0.fura_bias["default"].fill_(0.5)
+
+        x = torch.randn(4, 32)
+        expected = peft_model(x)
+        merged = peft_model.merge_and_unload()
+        assert torch.allclose(merged(x), expected, atol=1e-5, rtol=1e-5)
+
+    def test_unmerge_removes_the_created_bias(self):
+        model = MLP(in_features=32, hidden_features=64, out_features=16, bias=False)
+        config = FuRAConfig(target_modules=["lin0"], bias="fura_only")
+        peft_model = get_peft_model(model, config)
+        layer = peft_model.base_model.model.lin0
+
+        assert layer.get_base_layer().bias is None
+        layer.merge()
+        assert layer.get_base_layer().bias is not None
+        layer.unmerge()
+        assert layer.get_base_layer().bias is None
+
+
+class TestFuRASaveFrozenCore:
+    @pytest.mark.parametrize("save_frozen_core", [True, False])
+    def test_roundtrip(self, save_frozen_core, tmp_path):
+        torch.manual_seed(0)
+        model = MLP(in_features=32, hidden_features=64, out_features=16)
+        base_copy = copy.deepcopy(model)
+        config = FuRAConfig(target_modules=["lin0", "lin1"], save_frozen_core=save_frozen_core)
+        peft_model = get_peft_model(model, config)
+        # train a little so that the trainable core actually differs from its initialization
+        for layer_name in ("lin0", "lin1"):
+            layer = getattr(peft_model.base_model.model, layer_name)
+            trainable = "fura_r" if layer.fura_r["default"].requires_grad else "fura_l"
+            with torch.no_grad():
+                getattr(layer, trainable)["default"].add_(0.01)
+
+        x = torch.randn(4, 32)
+        expected = peft_model(x)
+        peft_model.save_pretrained(tmp_path)
+        reloaded = PeftModel.from_pretrained(base_copy, tmp_path)
+        assert torch.allclose(reloaded(x), expected, atol=1e-5, rtol=1e-5)
+
+    def test_frozen_core_is_omitted_from_the_checkpoint(self):
+        from peft.utils import get_peft_model_state_dict
+
+        model = MLP(in_features=32, hidden_features=64, out_features=16)
+        config = FuRAConfig(target_modules=["lin0"], save_frozen_core=False)
+        peft_model = get_peft_model(model, config)
+        layer = peft_model.base_model.model.lin0
+        frozen = layer.frozen_peft_weight_names["default"]
+
+        state_dict = get_peft_model_state_dict(peft_model)
+        assert frozen
+        for name in frozen:
+            assert not any(f".{name}." in key for key in state_dict)

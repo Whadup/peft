@@ -603,6 +603,15 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
             if "vblora_vector_bank" in k or "prompt_encoder" in k or ".tinylora_v." in k:
                 return True
 
+            # FuRA: with save_frozen_core=False the frozen core is deliberately absent from the checkpoint and
+            # recomputed from the base weights instead.
+            if (
+                config.peft_type == PeftType.FURA
+                and not config.save_frozen_core
+                and (".fura_l." in k or ".fura_r." in k)
+            ):
+                return True
+
             return (
                 config.peft_type == PeftType.UNILORA
                 and ".unilora_theta_d." in k

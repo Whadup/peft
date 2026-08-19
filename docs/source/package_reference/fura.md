@@ -34,6 +34,16 @@ explicitly. Setting `r` to an integer below `min(a, b)` gives up the full-rank p
 `train_position` and `s_merged_to` select which of the design corners from the paper is used: training the input core
 with the singular values kept as a separate trainable tensor is the default.
 
+## Checkpoint size
+
+Because the frozen core is a full-rank factorization of the pretrained weight, the default adapter checkpoint is
+*larger* than the weights it adapts. The frozen core is deterministic given the base weights, so it can be left out of
+the checkpoint with `FuRAConfig(save_frozen_core=False)`, which makes the checkpoint proportional to the trainable
+parameters instead. Loading such an adapter reconstructs the core from the base model, so it must be loaded against
+the same base weights it was created from.
+
+Note that adapter injection runs an SVD over every target module, which can take a while on large models.
+
 FuRA currently has the following constraint:
 
 - Only `nn.Linear` layers are supported.

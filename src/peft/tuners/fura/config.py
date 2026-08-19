@@ -70,7 +70,13 @@ class FuRAConfig(PeftConfig):
         output_factorization (`Optional[tuple[int, int]]`, *optional*, defaults to `None`):
             Custom (out_blocks, out_block_size) factorization for output dimension.
         input_factorization (`Optional[Union[tuple[int, int], str, dict]]`, *optional*, defaults to `None`):
-            Custom (in_blocks, in_block_size) factorization for input dimension, or `"head"` / `"closest"`.
+            Factorization of the input dimension, which together with `r` determines the trainable budget. Can be:
+            - `None` or `"closest"`: the near-square factorization of `in_features`.
+            - A `(in_blocks, in_block_size)` tuple applied to every target module.
+            - `"head"`: `(num_attention_heads, in_features // num_attention_heads)`, taken from the base model config.
+              Raises if the model has no `num_attention_heads` or the dimension is not divisible by it.
+            - A dict mapping module names to `(in_blocks, in_block_size)` tuples. Keys are matched as suffixes of the
+              fully qualified module name, longest key first; unmatched modules use the near-square default.
         fura_dropout (`float`, *optional*, defaults to `0.0`):
             Dropout probability for FuRA intermediate representation.
         fan_in_fan_out (`bool`, *optional*, defaults to `False`):
@@ -85,6 +91,13 @@ class FuRAConfig(PeftConfig):
             Whether to initialize adapter weights from base layer SVD (`True`) or random (`False`).
         quant_layout (`str`, *optional*, defaults to `"flat"`):
             QFuRA 4-bit quantization layout: `"flat"` or `"per_core_block"`.
+        save_frozen_core (`bool`, *optional*, defaults to `True`):
+            Whether to store the frozen BTT core in the adapter checkpoint. The frozen core is a full-rank
+            factorization of the pretrained weight, so with `save_frozen_core=True` the adapter is larger than the
+            weights it adapts. Setting it to `False` omits the frozen core and recomputes it from the base model on
+            load, which makes the checkpoint proportional to the trainable parameters. This requires loading against
+            the same base weights the adapter was created from, and is not compatible with `low_cpu_mem_usage=True` or
+            with `is_quantized=True`, since neither reconstructs the core from an SVD of the base weight.
         is_quantized (`bool`, *optional*, defaults to `False`):
             Whether to 4-bit quantize the frozen BTT core (QFuRA).
         modules_to_save (`Optional[list[str]]`, *optional*, defaults to `None`):
@@ -132,7 +145,12 @@ class FuRAConfig(PeftConfig):
     )
     input_factorization: Optional[Union[tuple[int, int], str, dict]] = field(
         default=None,
-        metadata={"help": "Optional (in_blocks, in_block_size) tuple, 'head', 'closest', or dict mapping."},
+        metadata={
+            "help": (
+                "Input factorization: None/'closest' for near-square, an (in_blocks, in_block_size) tuple, "
+                "'head' to split by attention heads, or a dict mapping module names to tuples."
+            )
+        },
     )
     fura_dropout: float = field(
         default=0.0,
@@ -161,6 +179,10 @@ class FuRAConfig(PeftConfig):
     quant_layout: str = field(
         default="flat",
         metadata={"help": "QFuRA 4-bit layout: 'flat' or 'per_core_block'."},
+    )
+    save_frozen_core: bool = field(
+        default=True,
+        metadata={"help": "Whether to save the frozen BTT core, which is recomputable from the base weights."},
     )
     is_quantized: bool = field(
         default=False,
@@ -222,6 +244,10 @@ class FuRAConfig(PeftConfig):
         if self.s_merged_to not in valid_s_merged_to:
             raise ValueError(f"s_merged_to must be one of {valid_s_merged_to}, got {self.s_merged_to!r}")
 
+        valid_init_modes = {"default", "mup"}
+        if self.init_mode not in valid_init_modes:
+            raise ValueError(f"init_mode must be one of {valid_init_modes}, got {self.init_mode!r}")
+
         valid_convert_modes = {"svd", "qr"}
         if self.convert_mode.lower() not in valid_convert_modes:
             raise ValueError(f"convert_mode must be one of {valid_convert_modes}, got {self.convert_mode!r}")
@@ -230,6 +256,41 @@ class FuRAConfig(PeftConfig):
         valid_quant_layouts = {"flat", "per_core_block"}
         if self.quant_layout not in valid_quant_layouts:
             raise ValueError(f"quant_layout must be one of {valid_quant_layouts}, got {self.quant_layout!r}")
+
+        if isinstance(self.input_factorization, str):
+            if self.input_factorization not in {"head", "closest"}:
+                raise ValueError(
+                    f"input_factorization as string must be 'head' or 'closest', got {self.input_factorization!r}"
+                )
+        elif isinstance(self.input_factorization, dict):
+            for key, value in self.input_factorization.items():
+                if not (isinstance(value, (tuple, list)) and len(value) == 2):
+                    raise ValueError(
+                        f"input_factorization dict values must be (in_blocks, in_block_size) pairs, got "
+                        f"{value!r} for key {key!r}"
+                    )
+        elif self.input_factorization is not None:
+            if not (isinstance(self.input_factorization, (tuple, list)) and len(self.input_factorization) == 2):
+                raise ValueError(
+                    "input_factorization must be None, a (in_blocks, in_block_size) pair, 'head', 'closest', or a "
+                    f"dict, got {self.input_factorization!r}"
+                )
+
+        if self.output_factorization is not None:
+            if not (isinstance(self.output_factorization, (tuple, list)) and len(self.output_factorization) == 2):
+                raise ValueError(
+                    "output_factorization must be None or a (out_blocks, out_block_size) pair, got "
+                    f"{self.output_factorization!r}"
+                )
+
+        if not self.save_frozen_core:
+            if self.is_quantized:
+                raise ValueError("save_frozen_core=False is not supported together with is_quantized=True.")
+            if self.init_weights is False or self.init_weights == "gaussian":
+                raise ValueError(
+                    "save_frozen_core=False requires init_weights=True, because the frozen core can only be "
+                    "recomputed from the base weights when it was derived from them in the first place."
+                )
 
         if self.bias not in {"none", "all", "fura_only"}:
             raise ValueError(f"bias must be one of 'none', 'all', or 'fura_only', got {self.bias!r}")

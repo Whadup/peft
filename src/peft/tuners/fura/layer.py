@@ -33,6 +33,18 @@ else:
     bnb = None
 
 
+def _unwrap_base_layer(base_layer: nn.Module) -> nn.Module:
+    """Return the `nn.Linear` a target module wraps, or the module itself.
+
+    Some model implementations wrap the projection in a thin module that exposes it as `.linear`. All base-weight
+    accesses must go through here so that the wrapper is handled consistently on every path.
+    """
+    inner = getattr(base_layer, "linear", None)
+    if isinstance(inner, nn.Linear):
+        return inner
+    return base_layer
+
+
 def _closest_factor_pair(d: int) -> tuple[int, int]:
     """Find factors (a, b) such that a * b = d and abs(a - b) is minimized."""
     root = int(d**0.5)
@@ -161,9 +173,7 @@ class FuRALayer(BaseTunerLayer):
 
         base_layer = self.get_base_layer()
         # Handle wrappers like Gemma4ClippableLinear by checking for a .linear attribute
-        actual_base = base_layer
-        if hasattr(base_layer, "linear") and isinstance(base_layer.linear, nn.Linear):
-            actual_base = base_layer.linear
+        actual_base = _unwrap_base_layer(base_layer)
 
         if (
             isinstance(actual_base, nn.Linear)
@@ -201,6 +211,7 @@ class FuRALayer(BaseTunerLayer):
         self,
         adapter_name: str,
         config: FuRAConfig,
+        input_factorization: Optional[tuple[int, int]] = None,
         **kwargs,
     ) -> None:
         decomp_mode = config.decomp_mode
@@ -238,11 +249,15 @@ class FuRALayer(BaseTunerLayer):
             out_blocks, out_block_size = _closest_factor_pair(self.out_features)
 
         # Compute input factorization
-        if isinstance(config.input_factorization, (tuple, list)):
-            in_blocks, in_block_size = config.input_factorization
+        # `input_factorization` is resolved by `FuRAModel` (the "head" and dict forms need the model config and the
+        # module name); `None` means the near-square factorization.
+        if input_factorization is None and isinstance(config.input_factorization, (tuple, list)):
+            input_factorization = tuple(config.input_factorization)
+        if input_factorization is not None:
+            in_blocks, in_block_size = input_factorization
             if in_blocks * in_block_size != self.in_features:
                 raise ValueError(
-                    f"input_factorization {config.input_factorization} does not match in_features={self.in_features}"
+                    f"input_factorization {tuple(input_factorization)} does not match in_features={self.in_features}"
                 )
         else:
             in_blocks, in_block_size = _closest_factor_pair(self.in_features)
@@ -287,9 +302,7 @@ class FuRALayer(BaseTunerLayer):
 
         base_layer = self.get_base_layer()
         # Handle wrappers like Gemma4ClippableLinear by checking for a .linear attribute
-        actual_base = base_layer
-        if hasattr(base_layer, "linear") and isinstance(base_layer.linear, nn.Linear):
-            actual_base = base_layer.linear
+        actual_base = _unwrap_base_layer(base_layer)
 
         weight = actual_base.weight
         if hasattr(weight, "data"):
@@ -364,9 +377,7 @@ class FuRALayer(BaseTunerLayer):
 
         base_layer = self.get_base_layer()
         # Handle wrappers like Gemma4ClippableLinear by checking for a .linear attribute
-        actual_base = base_layer
-        if hasattr(base_layer, "linear") and isinstance(base_layer.linear, nn.Linear):
-            actual_base = base_layer.linear
+        actual_base = _unwrap_base_layer(base_layer)
 
         weight = actual_base.weight
         if hasattr(weight, "data"):
@@ -562,10 +573,20 @@ class FuRALayer(BaseTunerLayer):
             return self.fura_l[adapter_name], frozen_dequant
         return self.fura_l[adapter_name], self.fura_r[adapter_name]
 
+    def _snapshot_base_weight(self) -> None:
+        """Keep a copy of the pretrained weight so that `unmerge` can restore it.
+
+        FuRA replaces the base weight on merge instead of adding a delta to it, so the original cannot be recovered by
+        subtracting anything. The copy is held on CPU to keep it off the accelerator, and dropped in `unmerge`.
+        """
+        base_weight = _unwrap_base_layer(self.get_base_layer()).weight
+        self._base_weight_before_merge = base_weight.data.detach().clone().cpu()
+
     def _get_base_weight_before_merge(self) -> torch.Tensor:
-        base_weight = self.get_base_layer().weight
+        """Return the pretrained weight: the snapshot while merged, the live weight otherwise."""
+        base_weight = _unwrap_base_layer(self.get_base_layer()).weight
         if self._base_weight_before_merge is None:
-            self._base_weight_before_merge = base_weight.data.detach().clone().cpu()
+            return base_weight.data
         return self._base_weight_before_merge.to(device=base_weight.device, dtype=base_weight.dtype)
 
     def materialize_dense_weight(self, adapter_name: str) -> torch.Tensor:
@@ -613,13 +634,14 @@ class Linear(nn.Module, FuRALayer):
         base_layer: nn.Module,
         adapter_name: str,
         config: FuRAConfig,
+        input_factorization: Optional[tuple[int, int]] = None,
         **kwargs,
     ) -> None:
         super().__init__()
         FuRALayer.__init__(self, base_layer, **kwargs)
         self.fan_in_fan_out = config.fan_in_fan_out
         self._active_adapter = adapter_name
-        self.update_layer(adapter_name, config=config)
+        self.update_layer(adapter_name, config=config, input_factorization=input_factorization)
 
     def merge(self, safe_merge: bool = False, adapter_names: Optional[list[str]] = None) -> None:
         """Merge active adapter weights into the base weights."""
@@ -636,8 +658,9 @@ class Linear(nn.Module, FuRALayer):
 
         for active_adapter in adapter_names:
             if active_adapter in self._available_adapters:
-                base_layer = self.get_base_layer()
+                base_layer = _unwrap_base_layer(self.get_base_layer())
                 orig_dtype = base_layer.weight.dtype
+                self._snapshot_base_weight()
                 delta_weight = self.get_delta_weight(active_adapter)
 
                 if safe_merge:
@@ -672,7 +695,7 @@ class Linear(nn.Module, FuRALayer):
             warnings.warn("Already unmerged. Nothing to do.")
             return
 
-        base_layer = self.get_base_layer()
+        base_layer = _unwrap_base_layer(self.get_base_layer())
         if self._base_weight_before_merge is not None:
             base_layer.weight.data.copy_(
                 self._base_weight_before_merge.to(device=base_layer.weight.device, dtype=base_layer.weight.dtype)
@@ -746,7 +769,7 @@ class Linear(nn.Module, FuRALayer):
                 out = out.permute(1, 0, 2).contiguous().reshape(*orig_shape[:-1], self.out_features)
 
                 # Add base layer bias or adapter bias if present
-                base_layer = self.get_base_layer()
+                base_layer = _unwrap_base_layer(self.get_base_layer())
                 if base_layer.bias is not None:
                     out = out + base_layer.bias.to(out.dtype)
                 if adapter_name in self.fura_bias:
