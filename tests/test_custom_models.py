@@ -41,6 +41,7 @@ from peft import (
     DeloraConfig,
     FourierFTConfig,
     FrodConfig,
+    FuRAConfig,
     GloraConfig,
     GraloraConfig,
     HiraConfig,
@@ -106,6 +107,20 @@ def _reset_unilora_theta_d(model, config, adapter_name="default"):
 # EmbConv1D has an embedding and a Conv1D layer
 # Conv2D has a Conv2D layer
 TEST_CASES = [
+    ########
+    # FuRA #
+    ########
+    ("Vanilla MLP 1 FuRA", "MLP", FuRAConfig, {"target_modules": "lin0"}),
+    ("Vanilla MLP 2 FuRA", "MLP", FuRAConfig, {"target_modules": ["lin0"]}),
+    ("Vanilla MLP 3 FuRA", "MLP", FuRAConfig, {"target_modules": ["lin1"]}),
+    ("Vanilla MLP 4 FuRA", "MLP", FuRAConfig, {"target_modules": ["lin0", "lin1"]}),
+    ("Vanilla MLP 5 FuRA", "MLP", FuRAConfig, {"target_modules": ["lin0"], "modules_to_save": ["lin1"]}),
+    (
+        "Vanilla MLP 6 FuRA",
+        "MLP",
+        FuRAConfig,
+        {"target_modules": ["lin0", "lin1"], "modules_to_save": ["lin1"]},
+    ),
     ########
     # GLoRA #
     ########
@@ -3845,16 +3860,23 @@ class TestPeftCustomModel(PeftCommonTester):
     @staticmethod
     def _check_requires_grad(module, adapter_name, requires_grad):
         # a bit of a clumsy way to test requires_grad on the PEFT parameters
+        frozen_names = getattr(module, "frozen_peft_weight_names", {}).get(adapter_name, ())
         for name in module.adapter_layer_names:
             module_dict = getattr(module, name)
             if adapter_name not in module_dict:
                 continue
+            # Adapter weights declared frozen (e.g. FuRA's frozen BTT core) should stay
+            # requires_grad=False even when the adapter is active.
+            if requires_grad and name in frozen_names:
+                expected = False
+            else:
+                expected = requires_grad
             attr = module_dict[adapter_name]
             if isinstance(attr, nn.Module):
                 for param in attr.parameters():
-                    assert param.requires_grad == requires_grad
+                    assert param.requires_grad == expected
             else:  # it's an nn.Parameter
-                assert attr.requires_grad == requires_grad
+                assert attr.requires_grad == expected
 
     @pytest.mark.parametrize("config_cls", ALL_PEFT_CONFIG_CLASSES)
     def test_set_requires_grad(self, config_cls):
@@ -5027,6 +5049,25 @@ class TestRequiresGrad:
     would be overkill.
 
     """
+
+    @staticmethod
+    def _get_frozen_peft_param_names(model):
+        """Collect fully-qualified names of params that frozen_peft_weight_names declares as non-trainable.
+
+        Tuners like FuRA intentionally keep some adapter weights frozen even when the adapter is active
+        (e.g. the frozen BTT core). This helper lets tests skip those params when checking requires_grad.
+        """
+        frozen = set()
+        for mod_prefix, module in model.named_modules():
+            fpwn = getattr(module, "frozen_peft_weight_names", {})
+            if not fpwn:
+                continue
+            for adapter_name, layer_names in fpwn.items():
+                for layer_name in layer_names:
+                    # The parameter path is: <mod_prefix>.<layer_name>.<adapter_name>
+                    parts = [p for p in (mod_prefix, layer_name, adapter_name) if p]
+                    frozen.add(".".join(parts))
+        return frozen
 
     def check_requires_grad(self, model, *params_expected: str):
         # Check that only the given parameters have requires_grad=True, and all others have requires_grad=False.
@@ -6698,6 +6739,7 @@ class TestRequiresGrad:
         # AdaLoRA's `ranknum` parameter is keyed by adapter name (so name contains ".default") but is intentionally
         # requires_grad=False, so we exclude it from the trainable-param check below.
         skip_ranknum = config_cls is AdaLoraConfig
+        skip_frozen_peft = config_cls is FuRAConfig
         model = DeepMLP(size=256)  # a size that works with all adapters
         extra_kwargs = {}
         if config_cls == IA3Config:
@@ -6719,9 +6761,12 @@ class TestRequiresGrad:
             model = ModelEmbConv1D()
         model = PeftModel.from_pretrained(model, tmp_path, is_trainable=is_trainable)
 
+        frozen_peft_names = self._get_frozen_peft_param_names(model) if skip_frozen_peft else set()
         if is_trainable:
             for name, param in model.named_parameters():
                 if skip_ranknum and "ranknum" in name:
+                    continue
+                if name in frozen_peft_names:
                     continue
                 if ".default" in name:
                     assert param.requires_grad
@@ -6737,9 +6782,12 @@ class TestRequiresGrad:
                 model.load_adapter(tmp_path, adapter_name="other", is_trainable=is_trainable)
             return
         model.load_adapter(tmp_path, adapter_name="other", is_trainable=is_trainable)
+        frozen_peft_names = self._get_frozen_peft_param_names(model) if skip_frozen_peft else set()
         if is_trainable:
             for name, param in model.named_parameters():
                 if skip_ranknum and "ranknum" in name:
+                    continue
+                if name in frozen_peft_names:
                     continue
                 if ".default" in name:
                     assert param.requires_grad
@@ -6757,6 +6805,7 @@ class TestRequiresGrad:
         # See note in test_loading_model_requires_grad_set_correctly: AdaLoRA's `ranknum.default` is intentionally
         # non-trainable, so we exclude it from the trainable-param check below.
         skip_ranknum = config_cls is AdaLoraConfig
+        skip_frozen_peft = config_cls is FuRAConfig
         model = DeepMLP(size=256)  # a size that works with all adapters
         extra_kwargs = {}
         if config_cls == IA3Config:
@@ -6790,9 +6839,12 @@ class TestRequiresGrad:
                 model.load_adapter(tmp_path, adapter_name="other", is_trainable=is_trainable)
             return
         model.load_adapter(tmp_path, adapter_name="other", is_trainable=is_trainable)
+        frozen_peft_names = self._get_frozen_peft_param_names(model) if skip_frozen_peft else set()
         if is_trainable:
             for name, param in model.named_parameters():
                 if skip_ranknum and "ranknum" in name:
+                    continue
+                if name in frozen_peft_names:
                     continue
                 if ".default" in name:
                     assert param.requires_grad
