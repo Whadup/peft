@@ -31,7 +31,7 @@ from peft.utils import (
 )
 
 from .config import FuRAConfig
-from .layer import FuRALayer, Linear, _resolve_blocktt_trainable_sides
+from .layer import FuRALayer, Linear
 
 
 def _get_tuner_layer_class(target_base_layer: torch.nn.Module) -> type[FuRALayer] | None:

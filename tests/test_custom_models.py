@@ -5054,8 +5054,8 @@ class TestRequiresGrad:
     def _get_frozen_peft_param_names(model):
         """Collect fully-qualified names of params that frozen_peft_weight_names declares as non-trainable.
 
-        Tuners like FuRA intentionally keep some adapter weights frozen even when the adapter is active
-        (e.g. the frozen BTT core). This helper lets tests skip those params when checking requires_grad.
+        Tuners like FuRA intentionally keep some adapter weights frozen even when the adapter is active (e.g. the
+        frozen BTT core). This helper lets tests skip those params when checking requires_grad.
         """
         frozen = set()
         for mod_prefix, module in model.named_modules():
@@ -6821,9 +6821,12 @@ class TestRequiresGrad:
         model = DeepMLP(size=256)
         model = PeftModel.from_pretrained(model, tmp_path, is_trainable=is_trainable)
 
+        frozen_peft_names = self._get_frozen_peft_param_names(model) if skip_frozen_peft else set()
         if is_trainable:
             for name, param in model.named_parameters():
                 if skip_ranknum and "ranknum" in name:
+                    continue
+                if name in frozen_peft_names:
                     continue
                 if ".default" in name:
                     assert param.requires_grad

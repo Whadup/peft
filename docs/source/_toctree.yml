@@ -226,6 +226,8 @@
       title: FourierFT
     - local: package_reference/frod
       title: FRoD
+    - local: package_reference/fura
+      title: FuRA
     - local: package_reference/glora
       title: GLoRA
     - local: package_reference/gralora

@@ -14,7 +14,6 @@
 
 from __future__ import annotations
 
-import math
 import warnings
 from typing import Any, Optional, Union
 
@@ -24,9 +23,9 @@ from torch import nn
 
 from peft.import_utils import is_bnb_4bit_available, is_bnb_available
 from peft.tuners.tuners_utils import BaseTunerLayer, check_adapters_to_merge
-from peft.utils.other import transpose
 
 from .config import FuRAConfig
+
 
 if is_bnb_available():
     import bitsandbytes as bnb
@@ -48,9 +47,7 @@ def _closest_factor_pair(d: int) -> tuple[int, int]:
     return best_a, best_b
 
 
-def _resolve_blocktt_trainable_sides(
-    left_size: int, right_size: int, train_position: str
-) -> tuple[bool, bool]:
+def _resolve_blocktt_trainable_sides(left_size: int, right_size: int, train_position: str) -> tuple[bool, bool]:
     if train_position not in {"small", "large", "both"}:
         raise ValueError("train_position must be one of: small, large, both")
     if train_position == "both":
@@ -153,12 +150,13 @@ class FuRALayer(BaseTunerLayer):
         self._qfura_frozen_dtype: dict[str, torch.dtype] = {}
         self._qfura_compute_dtype: dict[str, torch.dtype] = {}
         self._qfura_frozen_flat = nn.ParameterDict({})
-        self._qfura_frozen_blocks: dict[str, list[Any]] = {}
+        self._qfura_frozen_blocks = nn.ModuleDict({})
 
         self._disable_adapters = False
         self.merged_adapters: list[str] = []
         self._base_weight_before_merge: Optional[torch.Tensor] = None
         self._base_bias_before_merge: Optional[torch.Tensor] = None
+        self._base_bias_created = False
         self.kwargs = kwargs
 
         base_layer = self.get_base_layer()
@@ -167,9 +165,11 @@ class FuRALayer(BaseTunerLayer):
         if hasattr(base_layer, "linear") and isinstance(base_layer.linear, nn.Linear):
             actual_base = base_layer.linear
 
-        if isinstance(actual_base, nn.Linear):
-            self.in_features, self.out_features = actual_base.in_features, actual_base.out_features
-        elif hasattr(actual_base, "in_features") and hasattr(actual_base, "out_features"):
+        if (
+            isinstance(actual_base, nn.Linear)
+            or hasattr(actual_base, "in_features")
+            and hasattr(actual_base, "out_features")
+        ):
             self.in_features, self.out_features = actual_base.in_features, actual_base.out_features
         else:
             raise TypeError(f"Unsupported layer type '{type(base_layer)}' encountered for FuRALayer.")
@@ -275,7 +275,9 @@ class FuRALayer(BaseTunerLayer):
             high_rank = max(1, int(np.ceil(approx_rank)))
             low_params = m * n * low_rank * (a + b)
             high_params = m * n * high_rank * (a + b)
-            resolved_rank = low_rank if abs(low_params - target_params) <= abs(high_params - target_params) else high_rank
+            resolved_rank = (
+                low_rank if abs(low_params - target_params) <= abs(high_params - target_params) else high_rank
+            )
         elif isinstance(r_arg, int):
             resolved_rank = r_arg
         else:
@@ -324,7 +326,7 @@ class FuRALayer(BaseTunerLayer):
         self.fura_r[adapter_name].requires_grad = train_right
         if adapter_name in self.fura_s:
             resolved_s = self.s_merged_to[adapter_name]
-            self.fura_s[adapter_name].requires_grad = (resolved_s == "keep_trainable")
+            self.fura_s[adapter_name].requires_grad = resolved_s == "keep_trainable"
 
         frozen_names = []
         if not train_left:
@@ -333,7 +335,11 @@ class FuRALayer(BaseTunerLayer):
             frozen_names.append("fura_r")
         if adapter_name in self.fura_s and self.s_merged_to.get(adapter_name) != "keep_trainable":
             frozen_names.append("fura_s")
-        self.frozen_peft_weight_names[adapter_name] = tuple(frozen_names)
+        # `frozen_peft_weight_names` is a mutable class attribute on `BaseTunerLayer`, so it must be copied and
+        # rebound rather than mutated in place, or all layers in the process would share a single dict.
+        frozen_peft_weight_names = self.frozen_peft_weight_names.copy()
+        frozen_peft_weight_names[adapter_name] = tuple(frozen_names)
+        self.frozen_peft_weight_names = frozen_peft_weight_names
 
         # If QFuRA NF4 quantization is requested, quantize the frozen core
         if is_quantized:
@@ -343,7 +349,9 @@ class FuRALayer(BaseTunerLayer):
         self.set_adapter(self.active_adapters, inference_mode=config.inference_mode)
 
     @torch.no_grad()
-    def reset_fura_parameters(self, adapter_name: str, init_weights: Union[bool, str] = True, config: Optional[FuRAConfig] = None):
+    def reset_fura_parameters(
+        self, adapter_name: str, init_weights: Union[bool, str] = True, config: Optional[FuRAConfig] = None
+    ):
         m = self.m[adapter_name]
         n = self.n[adapter_name]
         a = self.a[adapter_name]
@@ -469,7 +477,7 @@ class FuRALayer(BaseTunerLayer):
         self,
         adapter_name: str,
         layout: str = "flat",
-        compute_dtype: torch.dtype = torch.bfloat16,
+        compute_dtype: Optional[torch.dtype] = None,
         double_quant: bool = True,
         quant_type: str = "nf4",
     ) -> None:
@@ -487,6 +495,11 @@ class FuRALayer(BaseTunerLayer):
         frozen_param = getattr(self, frozen_side)[adapter_name]
         frozen_shape = tuple(frozen_param.shape)
         frozen_dtype = frozen_param.dtype
+        if compute_dtype is None:
+            # Dequantization must produce the dtype the forward pass computes in, which is the dtype of the
+            # remaining (trainable) core, not a fixed bfloat16.
+            trainable_side = "fura_l" if l_train else "fura_r"
+            compute_dtype = getattr(self, trainable_side)[adapter_name].dtype
 
         self._qfura_frozen_side[adapter_name] = frozen_side
         self._qfura_frozen_shape[adapter_name] = frozen_shape
@@ -504,7 +517,7 @@ class FuRALayer(BaseTunerLayer):
             ).to(device=frozen_param.device)
             self._qfura_frozen_flat[adapter_name] = p4
         else:
-            block_list = []
+            block_list = nn.ParameterList()
             outer = frozen_shape[0]
             for i in range(outer):
                 block = frozen_param[i].detach().contiguous()
@@ -515,8 +528,8 @@ class FuRALayer(BaseTunerLayer):
                     compress_statistics=double_quant,
                     quant_storage=torch.uint8,
                 ).to(device=frozen_param.device)
-                self.register_parameter(f"_qfura_{adapter_name}_block_{i}", p4)
                 block_list.append(p4)
+            # Keyed by adapter name so that `delete_adapter` removes these along with the other adapter weights.
             self._qfura_frozen_blocks[adapter_name] = block_list
 
         # Remove the unquantized frozen parameter
@@ -567,13 +580,13 @@ class FuRALayer(BaseTunerLayer):
 
         # fura_r shape: (n, b, m * rank) -> reshape to (n, b, m, rank) -> permute(2, 0, 3, 1) -> (m, n, rank, b)
         # fura_l shape: (m, rank * n, a) -> reshape to (m, n, rank, a)
-        r = fura_r.reshape(n, b, m, rank).permute(2, 0, 3, 1)
-        l = fura_l.reshape(m, n, rank, a)
+        right = fura_r.reshape(n, b, m, rank).permute(2, 0, 3, 1)
+        left = fura_l.reshape(m, n, rank, a)
 
         if adapter_name in self.fura_s:
-            l = l * self.fura_s[adapter_name].unsqueeze(-1)
+            left = left * self.fura_s[adapter_name].unsqueeze(-1)
 
-        w_blocks = torch.einsum("mnra,mnrb->mnab", l, r)
+        w_blocks = torch.einsum("mnra,mnrb->mnab", left, right)
         dense_weight = w_blocks.permute(0, 2, 1, 3).reshape(self.out_features, self.in_features)
         return dense_weight
 
@@ -613,6 +626,13 @@ class Linear(nn.Module, FuRALayer):
         adapter_names = check_adapters_to_merge(self, adapter_names)
         if not adapter_names:
             return
+        # A FuRA layer materializes the whole weight (W = L @ S @ R) instead of adding a low-rank delta, so
+        # composing several adapters is not defined; merging more than one would produce W_a + W_b - W_base.
+        if len(adapter_names) > 1 or self.merged_adapters:
+            raise ValueError(
+                "FuRA only supports a single merged adapter at a time, but merging was requested for "
+                f"{sorted(set(adapter_names) | set(self.merged_adapters))}. Unmerge first, or merge one adapter."
+            )
 
         for active_adapter in adapter_names:
             if active_adapter in self._available_adapters:
@@ -624,17 +644,25 @@ class Linear(nn.Module, FuRALayer):
                     orig_weights = base_layer.weight.data.clone()
                     orig_weights += delta_weight.to(orig_weights.device, dtype=orig_dtype)
                     if not torch.isfinite(orig_weights).all():
-                        raise ValueError(
-                            f"NaNs detected in merged weights for adapter {active_adapter}"
-                        )
+                        raise ValueError(f"NaNs detected in merged weights for adapter {active_adapter}")
                     base_layer.weight.data = orig_weights
                 else:
                     base_layer.weight.data += delta_weight.to(base_layer.weight.device, dtype=orig_dtype)
 
-                if active_adapter in self.fura_bias and base_layer.bias is not None:
+                if active_adapter in self.fura_bias:
+                    if base_layer.bias is None:
+                        # The adapter contributes a bias the base layer does not have; give it one so that the
+                        # merged layer reproduces the unmerged forward pass.
+                        base_layer.bias = nn.Parameter(
+                            torch.zeros(self.out_features, device=base_layer.weight.device, dtype=orig_dtype),
+                            requires_grad=False,
+                        )
+                        self._base_bias_created = True
                     if self._base_bias_before_merge is None:
                         self._base_bias_before_merge = base_layer.bias.data.detach().clone().cpu()
-                    base_layer.bias.data += self.fura_bias[active_adapter].data.to(base_layer.bias.device, dtype=orig_dtype)
+                    base_layer.bias.data += self.fura_bias[active_adapter].data.to(
+                        base_layer.bias.device, dtype=orig_dtype
+                    )
 
                 self.merged_adapters.append(active_adapter)
 
@@ -656,6 +684,10 @@ class Linear(nn.Module, FuRALayer):
                 self._base_bias_before_merge.to(device=base_layer.bias.device, dtype=base_layer.bias.dtype)
             )
             self._base_bias_before_merge = None
+        if self._base_bias_created:
+            # Drop the bias that `merge` added on behalf of `fura_bias`.
+            base_layer.bias = None
+            self._base_bias_created = False
 
         self.merged_adapters.clear()
 
@@ -674,8 +706,12 @@ class Linear(nn.Module, FuRALayer):
                 result = self.base_layer(x, *args, **kwargs)
             else:
                 # Direct BlockTT forward for active adapters
+                if len(active_adapters) > 1:
+                    raise ValueError(
+                        "FuRA replaces the base weight rather than adding a delta, so only one adapter can be "
+                        f"active at a time, but got {active_adapters}."
+                    )
                 orig_shape = x.shape
-                # Compute using active adapter
                 adapter_name = active_adapters[0]
                 m = self.m[adapter_name]
                 n = self.n[adapter_name]
@@ -700,13 +736,13 @@ class Linear(nn.Module, FuRALayer):
                 inner = self.fura_dropout[adapter_name](inner)
 
                 # Step 2: (m, batch_n, n * rank) @ (m, n * rank, a) -> (m, batch_n, a)
-                l = fura_l
+                left = fura_l
                 if adapter_name in self.fura_s:
-                    l = (
-                        l.reshape(m, n, rank, a) * self.fura_s[adapter_name].unsqueeze(-1)
-                    ).reshape(m, rank * n, a)
+                    left = (left.reshape(m, n, rank, a) * self.fura_s[adapter_name].unsqueeze(-1)).reshape(
+                        m, rank * n, a
+                    )
 
-                out = torch.bmm(inner.reshape(m, batch_n, rank * n), l)
+                out = torch.bmm(inner.reshape(m, batch_n, rank * n), left)
                 out = out.permute(1, 0, 2).contiguous().reshape(*orig_shape[:-1], self.out_features)
 
                 # Add base layer bias or adapter bias if present

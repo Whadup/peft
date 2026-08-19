@@ -31,10 +31,19 @@ class FuRAConfig(PeftConfig):
 
     Args:
         r (`Union[int, float, str]`, *optional*, defaults to `"full"`):
-            FuRA rank. Can be:
-            - `"full"`: Full-rank decomposition min(a, b).
-            - An integer (`int > 0`): Fixed rank across blocks.
-            - A float in `(0, 1)`: Relative parameter budget fraction to determine rank.
+            Per-block FuRA rank. Can be:
+            - `"full"` (paper default): full rank per block, `min(a, b)`. This is what makes the decomposition lossless
+              and the resulting update full-rank; the trainable budget is then determined entirely by the factorization
+              (via `input_factorization` / `output_factorization`), not by this argument. With the default
+              `decomp_mode="output_one_block"` and `train_position="small"` the trainable count is `|R| + |S| = n * r *
+              b + n * r`, which for the automatic near-square factorization is approximately `d ** 1.5` for a `d x d`
+              layer.
+            - An integer (`int > 0`): fixed rank across blocks. Note that any value below `min(a, b)` gives up the
+              full-rank property that distinguishes FuRA from low-rank adapters.
+            - A float in `(0, 1)`: target size of *both* cores combined, as a fraction of the base weight's parameter
+              count. This is not the trainable fraction: with the default `train_position="small"` only the smaller
+              core (plus `S`) is trained, so the trainable fraction is considerably lower. The resulting rank is
+              clamped to at least 1, so small values may overshoot the requested budget.
         decomp_mode (`str`, *optional*, defaults to `"output_one_block"`):
             Decomposition mode for Block Tensor-Train (BTT):
             - `"output_one_block"`: m=1, a=out_features, n=in_blocks, b=in_block_size (FuRA paper default).

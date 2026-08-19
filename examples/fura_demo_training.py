@@ -1,36 +1,35 @@
+import argparse
+
 import torch
 from datasets import load_dataset
 from transformers import (
-    AutoModelForCausalLM, 
-    AutoTokenizer, 
+    AutoModelForCausalLM,
+    AutoTokenizer,
 )
-from trl import SFTTrainer, SFTConfig
-from peft import get_peft_model, FuRAConfig
-import argparse
+from trl import SFTConfig, SFTTrainer
+
+from peft import FuRAConfig, get_peft_model
+
 
 def train_fura(use_qfura=False):
     model_id = "google/gemma-4-E2B"
     print(f"Loading base model: {model_id}")
-    
+
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     tokenizer.pad_token = tokenizer.eos_token
-    
-    model = AutoModelForCausalLM.from_pretrained(
-        model_id, 
-        torch_dtype=torch.bfloat16, 
-        device_map="auto"
-    )
+
+    model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.bfloat16, device_map="auto")
 
     # FuRA / QFuRA Configuration
     print(f"Applying {'QFuRA' if use_qfura else 'FuRA'}...")
     config = FuRAConfig(
-        r="full", 
+        r="full",
         target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],
-        is_quantized=use_qfura,            # True for QFuRA, False for FuRA
-        quant_layout="flat", 
-        train_position="small", 
+        is_quantized=use_qfura,  # True for QFuRA, False for FuRA
+        quant_layout="flat",
+        train_position="small",
         s_merged_to="keep_trainable",
-        decomp_mode="output_one_block"
+        decomp_mode="output_one_block",
     )
 
     model = get_peft_model(model, config)
@@ -55,20 +54,11 @@ def train_fura(use_qfura=False):
             content = message["content"]
 
             if role == "user":
-                text += (
-                    "<start_of_turn>user\n"
-                    f"{content}"
-                    "<end_of_turn>\n"
-                )
+                text += f"<start_of_turn>user\n{content}<end_of_turn>\n"
             elif role == "assistant":
-                text += (
-                    "<start_of_turn>model\n"
-                    f"{content}"
-                    "<end_of_turn>\n"
-                )
+                text += f"<start_of_turn>model\n{content}<end_of_turn>\n"
 
         return {"text": text}
-
 
     dataset = dataset.map(
         format_example,
@@ -78,7 +68,6 @@ def train_fura(use_qfura=False):
     # SFT configuration
     sft_config = SFTConfig(
         output_dir="./fura_demo_results",
-
         # Training
         per_device_train_batch_size=4,
         gradient_accumulation_steps=1,
@@ -86,19 +75,15 @@ def train_fura(use_qfura=False):
         learning_rate=1e-4,
         lr_scheduler_type="cosine",
         warmup_steps=10,
-
         # Sequence handling
         dataset_text_field="text",
         max_length=16384,
-
         # Precision
         bf16=True,
-
         # Logging / saving
         logging_steps=5,
         save_strategy="no",
         report_to="none",
-
         # Useful for PEFT training
         remove_unused_columns=False,
     )
@@ -117,9 +102,10 @@ def train_fura(use_qfura=False):
     trainer.train()
     print("Training complete!")
 
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--qfura", action="store_true", help="Use QFuRA (quantized) instead of FuRA")
     args = parser.parse_args()
-    
+
     train_fura(use_qfura=args.qfura)
